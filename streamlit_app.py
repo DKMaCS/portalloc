@@ -15,8 +15,9 @@ with st.sidebar:
     rf = st.number_input("Risk-free rate (annual)", value=0.02, step=0.001, format="%.4f")
     gamma = st.number_input("Risk aversion γ (≥ 0)", value=300.0, step=10.0, min_value=0.0, format="%.2f")
     freq = st.selectbox("Periods per year", [252, 52, 12], index=0)
-    n_frontier = st.slider("Frontier points", 30, 300, 140)
-    frontier_mode = st.selectbox("Frontier mode", ["Target volatility (σ)"])  # only safe choice when unbounded
+    n_frontier = st.slider("Frontier points (γ sweep)", 30, 300, 140)
+    g_min = st.number_input("γ min (log sweep)", value=1e-2, format="%.4g")
+    g_max = st.number_input("γ max (log sweep)", value=1e4, format="%.4g")
 
     uploaded = st.file_uploader(
         "Upload CSV of prices (first col: Date; other cols: tickers).",
@@ -49,8 +50,6 @@ mu_vec, Sigma_mat = mu.values, Sigma.values
 
 # ---------------- Helpers ----------------
 def make_ef(mu, Sigma):
-    """Return an EfficientFrontier without box bounds (only ∑w=1).
-    Falls back to very wide numeric bounds if needed."""
     try:
         return EfficientFrontier(mu, Sigma, weight_bounds=(None, None))
     except Exception:
@@ -74,8 +73,9 @@ def portfolio_stats(w, mu_vec, Sigma_mat, rf):
     sharpe = (ret - rf) / max(vol, 1e-12)
     return ret, vol, sharpe
 
+# ---- Your γ-optimizer (keep exactly this objective) ----
 def solve_gamma_portfolio(mu_vec, Sigma_mat, rf, gamma):
-    """max (μ−rf)^T w − ½γ w^T Σ w  s.t. ∑w=1 (no box bounds)."""
+    """max (μ−rf)^T w − ½γ w^T Σ w  s.t. ∑w=1 (no box bounds)"""
     n = len(mu_vec)
     w = cp.Variable(n)
     mu_ex = mu_vec - rf
@@ -91,69 +91,57 @@ def solve_gamma_portfolio(mu_vec, Sigma_mat, rf, gamma):
             pass
     raise RuntimeError("CVXPY failed to solve γ-portfolio (unconstrained).")
 
-def compute_frontier_target_vol(mu, Sigma, rf, n_points):
-    """Sweep target volatility (efficient_risk) — robust without box bounds."""
-    ef_gmv = make_ef(mu, Sigma)
-    ef_gmv.min_volatility()
-    gmv_ret, gmv_vol, _ = ef_gmv.portfolio_performance(risk_free_rate=rf)
-
-    # high-σ anchor: max individual asset vol or 2×GMV σ
-    idx_hi = int(np.argmax(mu.values))
-    hi_vol = float(np.sqrt(Sigma.values[idx_hi, idx_hi]))
-    sig_targets = np.linspace(gmv_vol, max(hi_vol, 2*gmv_vol), n_points)
-
+# ---- Build the EF by sweeping γ using the SAME solver/objective ----
+def compute_frontier_by_gamma(mu_vec, Sigma_mat, rf, g_min, g_max, n_points):
+    gammas = np.logspace(np.log10(g_max), np.log10(g_min), n_points)  # high→low risk aversion
     vols, rets = [], []
     last_w = None
-    for s in sig_targets:
-        ef = make_ef(mu, Sigma)
-        try:
-            ef.efficient_risk(target_volatility=s)
-            w_dict = ef.clean_weights(cutoff=1e-8)
-            w_vec = clean_weights_array_from_dict(w_dict, mu.index, cutoff=0.0)
-            if last_w is not None and np.linalg.norm(w_vec - last_w, 1) <= 1e-8:
-                continue
-            ret, vol, _ = ef.portfolio_performance(risk_free_rate=rf)
-            vols.append(vol); rets.append(ret); last_w = w_vec
-        except Exception:
+    for g in gammas:
+        w = solve_gamma_portfolio(mu_vec, Sigma_mat, rf, g)
+        # skip near-duplicate corners
+        if last_w is not None and np.linalg.norm(w - last_w, 1) <= 1e-8:
             continue
-    return np.array(vols), np.array(rets), gmv_vol, gmv_ret
+        r, s, _ = portfolio_stats(w, mu_vec, Sigma_mat, rf)
+        rets.append(r); vols.append(s); last_w = w
+    vols, rets = np.array(vols), np.array(rets)
+    order = np.argsort(vols)
+    return vols[order], rets[order]
 
 # ---------------- Key portfolios ----------------
-# γ portfolio (investor preference; no bounds)
+# γ portfolio (investor preference)
 w_gamma = solve_gamma_portfolio(mu_vec, Sigma_mat, rf, gamma)
 w_gamma = clean_weights_array(w_gamma, cutoff=1e-6)
 gamma_ret, gamma_vol, gamma_sharpe = portfolio_stats(w_gamma, mu_vec, Sigma_mat, rf)
 
-# Tangency (max Sharpe) — still valid with no bounds
+# Tangency (max Sharpe) — just as a reference marker
 ef_tan = make_ef(mu, Sigma)
 ef_tan.max_sharpe(risk_free_rate=rf)
 w_tan_dict = ef_tan.clean_weights(cutoff=1e-8)
 w_tan = clean_weights_array_from_dict(w_tan_dict, tickers, cutoff=1e-8)
 tan_ret, tan_vol, tan_sharpe = ef_tan.portfolio_performance(risk_free_rate=rf)
 
-# GMV (min variance) — no bounds
+# GMV (min variance) — reference marker
 ef_gmv = make_ef(mu, Sigma)
 ef_gmv.min_volatility()
 w_gmv_dict = ef_gmv.clean_weights(cutoff=1e-8)
 w_gmv = clean_weights_array_from_dict(w_gmv_dict, tickers, cutoff=1e-8)
 gmv_ret, gmv_vol, _ = ef_gmv.portfolio_performance(risk_free_rate=rf)
 
-# Frontier curve (preference-free) — σ-sweep only
-ef_vols, ef_rets, gmv_vol, gmv_ret = compute_frontier_target_vol(mu, Sigma, rf, n_frontier)
+# Frontier built by γ-sweep (so γ point lies on it)
+ef_vols, ef_rets = compute_frontier_by_gamma(mu_vec, Sigma_mat, rf, g_min=g_min, g_max=g_max, n_points=n_frontier)
 
 # ---------------- Plot ----------------
-fig, ax = plt.subplots(figsize=(4, 3))
+fig, ax = plt.subplots(figsize=(5.0, 3.6), dpi=120)
 
 if ef_vols.size:
-    order = np.argsort(ef_vols)
-    ax.plot(ef_vols[order], ef_rets[order], lw=1.6, alpha=0.95, label="Efficient Frontier")
+    ax.plot(ef_vols, ef_rets, lw=1.8, alpha=0.95, label="Efficient Frontier (γ sweep)")
 
 # key points
 ax.scatter([gmv_vol], [gmv_ret], marker="D", label="GMV")
-ax.scatter([tan_vol], [tan_ret], marker="*", s=140, label="Tangency")
+ax.scatter([tan_vol], [tan_ret], marker="*", s=120, label="Tangency")
 ax.scatter([gamma_vol], [gamma_ret], marker="o", label=f"Γ-Portfolio (γ={gamma:.2f})")
 
-# CML
+# CML (through tangency) for reference only
 xmax = 1.05 * max(tan_vol, gamma_vol, (ef_vols.max() if ef_vols.size else 0.0))
 x = np.linspace(0, xmax, 200)
 cml = rf + (tan_ret - rf) * (x / max(tan_vol, 1e-12))
@@ -163,9 +151,9 @@ ax.set_xlim(0, xmax)
 ax.margins(y=0.05)
 ax.set_xlabel("Volatility (σ, annualized)")
 ax.set_ylabel("Expected Return (μ, annualized)")
-ax.set_title("Efficient Frontier — Unconstrained Weights (∑w=1) + Γ-Portfolio")
-ax.legend(loc="best")
-st.pyplot(fig, clear_figure=True)
+ax.set_title("Efficient Frontier — Unconstrained Weights (∑w=1) traced by γ")
+ax.legend(loc="best", fontsize=8)
+st.pyplot(fig, clear_figure=True, use_container_width=False)
 
 # ---------------- Tables ----------------
 st.markdown("### Portfolio Performance Summary")
@@ -195,7 +183,7 @@ with c2:
     st.subheader("Tangency")
     st.dataframe(weights_df(w_tan, tickers), use_container_width=True)
 with c3:
-    st.subheader(f"Risk-averse (γ={gamma:.2f})")
+    st.subheader(f"Γ-Portfolio (γ={gamma:.2f})")
     st.dataframe(weights_df(w_gamma, tickers), use_container_width=True)
 
 # ---------------- Export ----------------
@@ -208,12 +196,12 @@ export_df = pd.DataFrame({
 st.download_button(
     "Download Weights CSV",
     data=export_df.to_csv(index=False),
-    file_name="weights_unconstrained.csv",
+    file_name="weights_unconstrained_gamma_frontier.csv",
     mime="text/csv"
 )
 
 st.caption(
-    "Unconstrained weights (no box bounds), budget ∑w=1. "
-    "Frontier built by target σ to avoid unbounded-return issues when shorts are allowed. "
-    "γ selects an efficient portfolio on this frontier."
+    "The blue curve is produced by sweeping γ with the same objective used for the Γ-portfolio. "
+    "Therefore the green point lies on the frontier (up to numerical tolerance). "
+    "If the γ point still looks farther right, increase the γ sweep range or x-axis limit."
 )
