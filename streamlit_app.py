@@ -92,27 +92,39 @@ def feasible_return_bounds(mu_vec, lb, ub):
     raise RuntimeError("Could not bracket feasible return range.")
 
 def compute_frontier_target_return_feasible(mu, Sigma, rf, lb, ub, n_points):
-    """Sweep target return over the *feasible* range, starting at GMV return."""
+    """Sweep target return over the *feasible* range starting at GMV return,
+    but back off the cap and dedupe near-identical points."""
     # GMV stats
     ef_gmv = EfficientFrontier(mu, Sigma, weight_bounds=(lb, ub))
     ef_gmv.min_volatility()
     gmv_ret, gmv_vol, _ = ef_gmv.portfolio_performance(risk_free_rate=rf)
 
-    # Feasible μ-range under bounds
+    # Feasible μ-range under bounds (cap is μ_max for long-only)
     r_lo, r_hi = feasible_return_bounds(mu.values, lb, ub)
-    r_start = max(gmv_ret, r_lo)  # start on efficient set
+    r_cap = float(mu.max())  # max achievable μ under long-only
+    r_hi = min(r_hi, r_cap) - 1e-8
+    r_start = max(gmv_ret, r_lo)
 
     targets = np.linspace(r_start, r_hi, n_points)
+
     vols, rets = [], []
+    last_w = None
     for r in targets:
         ef = EfficientFrontier(mu, Sigma, weight_bounds=(lb, ub))
         try:
             ef.efficient_return(target_return=r)
+            # dedupe by weights (more robust than returns alone)
+            w_dict = ef.clean_weights(cutoff=1e-6)
+            w_vec = np.array([w_dict.get(t, 0.0) for t in mu.index])
+            if last_w is not None and np.linalg.norm(w_vec - last_w, 1) <= 1e-6:
+                continue
             ret, vol, _ = ef.portfolio_performance(risk_free_rate=rf)
-            vols.append(vol); rets.append(ret)
+            rets.append(ret); vols.append(vol)
+            last_w = w_vec
         except Exception:
-            continue  # skip edge infeasibilities
+            continue
     return np.array(vols), np.array(rets)
+
 
 def compute_frontier_target_vol(mu, Sigma, rf, lb, ub, n_points):
     """Sweep target volatility (efficient_risk) to get even σ spacing."""
@@ -136,22 +148,35 @@ def compute_frontier_target_vol(mu, Sigma, rf, lb, ub, n_points):
             continue
     return np.array(vols), np.array(rets)
 
+def clean_clip_weights(w, lb=0.0, ub=1.0, cutoff=1e-6):
+    w = np.array(w, float).ravel()
+    w[np.abs(w) < cutoff] = 0.0
+    w = np.clip(w, lb, ub)
+    s = w.sum()
+    return w if s == 0 else w / s
+
 # ---------------- Key portfolios ----------------
 # γ portfolio (investor preference)
 w_gamma = solve_gamma_portfolio(mu_vec, Sigma_mat, rf, gamma, lower_bound, upper_bound)
+w_gamma = clean_clip_weights(w_gamma, lb=lower_bound, ub=upper_bound, cutoff=1e-4)
 gamma_ret, gamma_vol, gamma_sharpe = portfolio_stats(w_gamma, mu_vec, Sigma_mat, rf)
+
 
 # Tangency (max Sharpe)
 ef_tan = EfficientFrontier(mu, Sigma, weight_bounds=(lower_bound, upper_bound))
-w_tan_dict = ef_tan.max_sharpe(risk_free_rate=rf)
+ef_tan.max_sharpe(risk_free_rate=rf)
+w_tan_dict = ef_tan.clean_weights(cutoff=1e-6)   # <- important
 w_tan = np.array([w_tan_dict.get(t, 0.0) for t in tickers])
 tan_ret, tan_vol, tan_sharpe = ef_tan.portfolio_performance(risk_free_rate=rf)
 
+
 # GMV (min variance)
 ef_gmv = EfficientFrontier(mu, Sigma, weight_bounds=(lower_bound, upper_bound))
-w_gmv_dict = ef_gmv.min_volatility()
+ef_gmv.min_volatility()
+w_gmv_dict = ef_gmv.clean_weights(cutoff=1e-6)   # <- important
 w_gmv = np.array([w_gmv_dict.get(t, 0.0) for t in tickers])
 gmv_ret, gmv_vol, _ = ef_gmv.portfolio_performance(risk_free_rate=rf)
+
 
 # Frontier curve (preference-free)
 if frontier_mode.startswith("Target return"):
@@ -204,6 +229,9 @@ def weights_df(weights, tickers):
     df["Weight"] = df["Weight"].round(6)
     return df[df["Weight"].abs() > 1e-8].sort_values("Weight", ascending=False).reset_index(drop=True)
 
+
+
+
 st.markdown("### Portfolio Weights")
 c1, c2, c3 = st.columns(3)
 with c1:
@@ -213,7 +241,7 @@ with c2:
     st.subheader("Tangency")
     st.dataframe(weights_df(w_tan, tickers), use_container_width=True)
 with c3:
-    st.subheader(f"Γ-Portfolio (γ={gamma:.2f})")
+    st.subheader(f"Risk-averse (γ={gamma:.2f})")
     st.dataframe(weights_df(w_gamma, tickers), use_container_width=True)
 
 # ---------------- Export ----------------
@@ -221,8 +249,9 @@ export_df = pd.DataFrame({
     "Ticker": tickers,
     "GMV": np.array([w_gmv_dict.get(t, 0.0) for t in tickers]),
     "Tangency": np.array([w_tan_dict.get(t, 0.0) for t in tickers]),
-    f"Gamma_{gamma:.2f}": w_gamma
+    f"Gamma_{gamma:.2f}": w_gamma,                      # already cleaned
 })
+
 st.download_button(
     "Download Weights CSV",
     data=export_df.to_csv(index=False),
