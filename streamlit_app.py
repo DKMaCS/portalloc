@@ -5,14 +5,14 @@ import streamlit as st
 import matplotlib.pyplot as plt
 from pypfopt import risk_models, EfficientFrontier
 
-st.set_page_config(page_title="Efficient Frontier & CML — Theoretical (γ-sweep)", layout="wide")
-st.title("Efficient Frontier — Theoretical (Unconstrained, ∑w=1) via γ-sweep")
+st.set_page_config(page_title="Theoretical Efficient Frontier — γ sweep", layout="wide")
+st.title("Theoretical Efficient Frontier (Unconstrained, ∑w=1) — γ sweep")
 
 # ---------------- Sidebar ----------------
 with st.sidebar:
     st.header("Inputs")
-    rf = st.number_input("Risk-free rate (annual)", value=0.02, step=0.001, format="%.4f")
-    gamma_sel = st.number_input("Risk aversion γ (≥ 0)", value=300.0, step=10.0, min_value=0.0, format="%.2f")
+    rf = st.number_input("Risk-free rate (annual)", value=0.02, step=0.001, format="%.4f")  # used only for Sharpe/CML
+    gamma_sel = st.number_input("Selected risk aversion γ (≥ 0)", value=10.0, step=1.0, min_value=0.0, format="%.2f")
     freq = st.selectbox("Periods per year", [252, 52, 12], index=0)
     n_frontier = st.slider("Frontier points (γ sweep)", 30, 400, 160)
     g_min = st.number_input("γ min (log sweep)", value=1e-2, format="%.4g")
@@ -48,82 +48,77 @@ Sigma = risk_models.sample_cov(rets, frequency=freq, returns_data=True)  # annua
 mu_vec, Sigma_mat = mu.values, Sigma.values
 n = len(mu_vec)
 
-# -------------- Closed-form γ-portfolio (KKT) ----------------
-# Maximize (μ-rf)^T w − ½ γ w^T Σ w s.t. 1^T w = 1
-# KKT → γ Σ w = (μ-rf) − λ 1  → w = (1/γ) Σ^{-1}[(μ-rf) − λ 1]
-# with λ chosen so 1^T w = 1.
-def gamma_weights_closed_form(mu_vec, Sigma_mat, rf, gamma, ridge=0.0):
-    # tiny ridge for numerical stability if needed
-    if ridge > 0:
-        Sigma_mat = Sigma_mat + ridge * np.trace(Sigma_mat)/len(Sigma_mat) * np.eye(len(Sigma_mat))
-
-    # Solve Σ x = b by linear solve (no explicit inverse)
-    ones = np.ones_like(mu_vec)
-    # u = Σ^{-1}(μ - rf*1), v = Σ^{-1}1
-    u = np.linalg.solve(Sigma_mat, mu_vec - rf*ones)
-    v = np.linalg.solve(Sigma_mat, ones)
-    A = ones @ v               # = 1^T Σ^{-1} 1
-    # Enforce budget 1^T w = 1:
-    # w = (1/γ) u - (( (1/γ) * 1^T u - 1 )/A) v
-    oneTu = ones @ u
-    w = (1.0/gamma) * u - (( (1.0/gamma) * oneTu - 1.0 )/A) * v
-    return w
-
+# ---------------- Helpers ----------------
 def clean(w, cutoff=1e-10):
     w = np.array(w, float).ravel()
     w[np.abs(w) < cutoff] = 0.0
     s = w.sum()
-    return w if s == 0 else w/s
+    return w if s == 0 else w / s
 
-def stats(w):
+def stats(w, rf_for_sharpe):
     r = float(w @ mu_vec)
     s2 = float(w @ Sigma_mat @ w)
     s = float(np.sqrt(max(s2, 0.0)))
-    sh = (r - rf)/max(s, 1e-12)
+    sh = (r - rf_for_sharpe) / max(s, 1e-12)
     return r, s, sh
 
-# -------------- Trace the theoretical frontier by γ-sweep --------------
+# ---------------- Closed-form γ-portfolio (unconstrained except ∑w=1) ----------------
+# max μ^T w − ½γ w^T Σ w   s.t. 1^T w = 1
+# KKT:  γ Σ w = μ − λ 1  ⇒  w = (1/γ) Σ^{-1}(μ − λ 1), with λ s.t. 1^T w = 1
+def gamma_weights_closed_form(mu_vec, Sigma_mat, gamma, ridge=0.0):
+    gamma = float(max(gamma, 1e-12))  # avoid divide-by-zero
+    if ridge > 0:
+        Sigma_mat = Sigma_mat + ridge * np.trace(Sigma_mat)/len(Sigma_mat) * np.eye(len(Sigma_mat))
+    ones = np.ones_like(mu_vec)
+    # Solve linear systems instead of inverting
+    u = np.linalg.solve(Sigma_mat, mu_vec)   # Σ^{-1} μ
+    v = np.linalg.solve(Sigma_mat, ones)     # Σ^{-1} 1
+    A = float(ones @ v)                      # 1^T Σ^{-1} 1
+    oneTu = float(ones @ u)                  # 1^T Σ^{-1} μ
+    # Enforce budget: 1^T w = 1 ⇒ λ = ( (1/γ) oneTu - 1 ) / A
+    lam = ((1.0/gamma) * oneTu - 1.0) / A
+    w = (1.0/gamma) * u - lam * v
+    return w
+
+# ---------------- Trace the theoretical EF by sweeping γ ----------------
 gammas = np.logspace(np.log10(g_max), np.log10(g_min), n_frontier)  # high→low risk aversion
 ef_rets, ef_vols, ef_ws = [], [], []
 last_w = None
 for g in gammas:
-    w = gamma_weights_closed_form(mu_vec, Sigma_mat, rf, g)
+    w = gamma_weights_closed_form(mu_vec, Sigma_mat, g)
     w = clean(w)
-    if last_w is not None and np.linalg.norm(w-last_w, 1) <= 1e-10:
+    if last_w is not None and np.linalg.norm(w - last_w, 1) <= 1e-10:
         continue
-    r, s, _ = stats(w)
+    r, s, _ = stats(w, rf_for_sharpe=rf)
     ef_rets.append(r); ef_vols.append(s); ef_ws.append(w); last_w = w
 ef_rets, ef_vols = np.array(ef_rets), np.array(ef_vols)
 
-# -------------- Your selected γ portfolio (sits on that curve) --------------
-# Guard against gamma=0
-gamma_eff = max(float(gamma_sel), 1e-12)
-w_gamma = clean(gamma_weights_closed_form(mu_vec, Sigma_mat, rf, gamma_eff))
-gamma_ret, gamma_vol, gamma_sharpe = stats(w_gamma)
+# ---------------- Selected γ portfolio (sits on that curve) ----------------
+w_gamma = clean(gamma_weights_closed_form(mu_vec, Sigma_mat, gamma_sel))
+gamma_ret, gamma_vol, gamma_sharpe = stats(w_gamma, rf_for_sharpe=rf)
 
-# -------------- GMV and Tangency (unconstrained) for reference --------------
-# GMV is γ→∞ limit; Tangency is max Sharpe
+# ---------------- GMV & Tangency (unconstrained) for reference ----------------
 ef_gmv = EfficientFrontier(mu, Sigma, weight_bounds=(None, None))
 ef_gmv.min_volatility()
-w_gmv = np.array([ef_gmv.clean_weights(1e-12).get(t,0.0) for t in tickers]); w_gmv = clean(w_gmv)
+w_gmv = clean(np.array([ef_gmv.clean_weights(1e-12).get(t, 0.0) for t in tickers]))
 gmv_ret, gmv_vol, _ = ef_gmv.portfolio_performance(risk_free_rate=rf)
 
 ef_tan = EfficientFrontier(mu, Sigma, weight_bounds=(None, None))
 ef_tan.max_sharpe(risk_free_rate=rf)
-w_tan = np.array([ef_tan.clean_weights(1e-12).get(t,0.0) for t in tickers]); w_tan = clean(w_tan)
+w_tan = clean(np.array([ef_tan.clean_weights(1e-12).get(t, 0.0) for t in tickers]))
 tan_ret, tan_vol, tan_sharpe = ef_tan.portfolio_performance(risk_free_rate=rf)
 
-# -------------- Plot --------------
+# ---------------- Plot ----------------
 fig, ax = plt.subplots(figsize=(5.0, 3.6), dpi=120)
 
 order = np.argsort(ef_vols)
-ax.plot(ef_vols[order], ef_rets[order], lw=1.8, label="Efficient Frontier (γ-sweep)")
+ax.plot(ef_vols[order], ef_rets[order], lw=1.8, label="Efficient Frontier (γ sweep)")
 
 ax.scatter([gmv_vol], [gmv_ret], marker="D", label="GMV")
 ax.scatter([tan_vol], [tan_ret], marker="*", s=110, label="Tangency")
 ax.scatter([gamma_vol], [gamma_ret], marker="o", label=f"Γ-Portfolio (γ={gamma_sel:.2f})")
 
-# CML (reference)
+# Optional CML (just for comparison)
 xmax = 1.05 * max(tan_vol, gamma_vol, (ef_vols.max() if ef_vols.size else 0.0))
 x = np.linspace(0, xmax, 200)
 cml = rf + (tan_ret - rf) * (x / max(tan_vol, 1e-12))
@@ -133,11 +128,11 @@ ax.set_xlim(0, xmax)
 ax.margins(y=0.05)
 ax.set_xlabel("Volatility (σ, annualized)")
 ax.set_ylabel("Expected Return (μ, annualized)")
-ax.set_title("Theoretical Efficient Frontier (unconstrained) — traced by γ")
+ax.set_title("Theoretical Efficient Frontier (unconstrained, ∑w=1)")
 ax.legend(loc="best", fontsize=8)
-st.pyplot(fig, clear_figure=True)
+st.pyplot(fig, clear_figure=True, use_container_width=False)
 
-# -------------- Tables --------------
+# ---------------- Tables ----------------
 st.markdown("### Portfolio Performance Summary")
 summary_df = pd.DataFrame({
     "Portfolio": ["GMV", "Tangency", f"Gamma (γ={gamma_sel:.2f})"],
@@ -168,7 +163,7 @@ with c3:
     st.subheader(f"Γ-Portfolio (γ={gamma_sel:.2f})")
     st.dataframe(weights_df(w_gamma, tickers), use_container_width=True)
 
-# -------------- Export --------------
+# ---------------- Export ----------------
 export_df = pd.DataFrame({
     "Ticker": tickers,
     "GMV": w_gmv,
@@ -178,11 +173,11 @@ export_df = pd.DataFrame({
 st.download_button(
     "Download Weights CSV",
     data=export_df.to_csv(index=False),
-    file_name="weights_unconstrained_gamma_frontier.csv",
+    file_name="weights_theoretical_gamma_frontier.csv",
     mime="text/csv"
 )
 
 st.caption(
-    "Frontier is generated by the same γ-objective as the selected portfolio (unconstrained except ∑w=1). "
-    "Therefore the Γ-portfolio lies on the plotted frontier to numerical precision."
+    "Frontier is generated by solving max μᵀw − ½γ wᵀΣw under ∑w=1 across a log-spaced γ grid. "
+    "Because the Γ-portfolio uses the same objective/feasible set, it lies on the plotted frontier."
 )
