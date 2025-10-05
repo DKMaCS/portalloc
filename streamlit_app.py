@@ -1,4 +1,3 @@
-# streamlit_app.py
 import numpy as np
 import pandas as pd
 import streamlit as st
@@ -9,11 +8,11 @@ from pypfopt import risk_models
 st.set_page_config(page_title="Efficient Frontier & CML — Box Bounds", layout="wide")
 st.title("Efficient Frontier & CML (Box Bounds; ∑w = 1)")
 
-# ---------------- Fixed γ sweep (hard-coded) ----------------
+#  Fixed γ sweep (hard-coded)   
 G_SWEEP_MIN = 1e-2     # small γ => risk-seeking end
 G_SWEEP_MAX = 1e4      # large γ => risk-averse end
 
-# ---------------- Sidebar ----------------
+#  Sidebar   
 with st.sidebar:
     st.header("Inputs")
     rf = st.number_input("Risk-free rate (annual)", value=0.02, step=0.001, format="%.4f")
@@ -49,13 +48,13 @@ if prices.shape[1] < 2:
 
 tickers = list(prices.columns)
 
-# ---------------- μ and Σ from log returns (annualized) ----------------
+#  μ and Σ from log returns (annualized)   
 rets = np.log(prices).diff().dropna()
 mu = rets.mean() * freq
 Sigma = risk_models.sample_cov(rets, frequency=freq, returns_data=True)  # annualized
 mu_vec, Sigma_mat = mu.values, Sigma.values
 
-# ---------------- Helpers ----------------
+#  Helpers   
 def clean_and_project(w, lb, ub, cutoff=1e-8):
     """Zero tiny weights, clip to [lb, ub], then renormalize to sum to 1."""
     w = np.array(w, float).ravel()
@@ -70,7 +69,7 @@ def portfolio_stats(w, mu_vec, Sigma_mat, rf):
     sharpe = (ret - rf) / max(vol, 1e-12)
     return ret, vol, sharpe
 
-# ---------------- Solvers under BOX BOUNDS ----------------
+#  Solvers under BOX BOUNDS   
 def solve_gamma_portfolio(mu_vec, Sigma_mat, rf, gamma, lb, ub):
     """
     max (μ−rf)^T w − ½γ w^T Σ w
@@ -107,7 +106,7 @@ def solve_gmv(Sigma_mat, lb, ub):
             pass
     raise RuntimeError("CVXPY failed in GMV solve.")
 
-# ---------------- Frontier traced by γ (same constraints) ----------------
+#  Frontier traced by γ (same constraints)   
 def compute_frontier_by_gamma(mu_vec, Sigma_mat, rf, lb, ub, n_points):
     gammas = np.logspace(np.log10(G_SWEEP_MAX), np.log10(G_SWEEP_MIN), n_points)  # high→low risk aversion
     vols, rets, ws = [], [], []
@@ -124,7 +123,7 @@ def compute_frontier_by_gamma(mu_vec, Sigma_mat, rf, lb, ub, n_points):
     order = np.argsort(vols)
     return vols[order], rets[order], [ws[i] for i in order]
 
-# ---------------- Key portfolios ----------------
+#  Key portfolios   
 # γ portfolio (investor choice) — BOX BOUNDS
 w_gamma = solve_gamma_portfolio(mu_vec, Sigma_mat, rf, gamma, lower_bound, upper_bound)
 w_gamma = clean_and_project(w_gamma, lower_bound, upper_bound, cutoff=1e-8)
@@ -151,7 +150,7 @@ else:
     tan_vol = tan_ret = 0.0
     w_tan = np.zeros_like(mu_vec)
 
-# ---------------- Plot ----------------
+#  Plot   
 fig, ax = plt.subplots(figsize=(4, 3), dpi=120)
 
 if ef_vols.size:
@@ -176,7 +175,7 @@ ax.set_title(f"Efficient Frontier — Box Bounds [{lower_bound:.1f}, {upper_boun
 ax.legend(loc="best", fontsize=8)
 st.pyplot(fig, clear_figure=True)
 
-# ---------------- Tables ----------------
+#  Tables   
 st.markdown("### Portfolio Performance Summary")
 summary_df = pd.DataFrame({
     "Portfolio": ["GMV", "Tangency (constr.)", f"Gamma (γ={gamma:.2f})"],
@@ -207,7 +206,7 @@ with c3:
     st.subheader(f"Γ-Portfolio (γ={gamma:.2f})")
     st.dataframe(weights_df(w_gamma, tickers), use_container_width=True)
 
-# ---------------- Export ----------------
+#  Export   
 export_df = pd.DataFrame({
     "Ticker": tickers,
     "GMV": w_gmv,
