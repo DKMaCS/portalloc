@@ -142,7 +142,7 @@ gmv_ret, gmv_vol, _ = ef_gmv.portfolio_performance(risk_free_rate=rf)
 ef_vols, ef_rets, gmv_vol, gmv_ret = compute_frontier_target_vol(mu, Sigma, rf, n_frontier)
 
 # ---------------- Plot ----------------
-fig, ax = plt.subplots(figsize=(7.8, 5.6))
+fig, ax = plt.subplots(figsize=(5.2, 3.6))
 
 if ef_vols.size:
     order = np.argsort(ef_vols)
