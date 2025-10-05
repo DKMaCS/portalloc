@@ -14,7 +14,7 @@ with st.sidebar:
     st.header("Inputs")
     rf = st.number_input("Risk-free rate (annual, e.g. 0.02 = 2%)", value=0.02, step=0.001, format="%.4f")
     gamma = st.number_input("Risk aversion γ (≥ 0)", value=300.0, step=10.0, min_value=0.0, format="%.2f")
-    freq = st.selectbox("Periods per year", [252, 365, 12], index=0)
+    freq = st.selectbox("Periods per year", [252, 12, 52], index=0)
     allow_short = st.checkbox("Allow shorting (long/short)", value=False)
     n_frontier = st.slider("Frontier points", 30, 200, 100)
     lower_bound = -1.0 if allow_short else 0.0
