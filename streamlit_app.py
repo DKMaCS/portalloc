@@ -21,7 +21,7 @@ with st.sidebar:
     upper_bound = 1.0
 
     uploaded = st.file_uploader(
-        "Upload CSV of **daily prices** (first col: Date; other cols: tickers).",
+        "Upload CSV of **daily/weekly/monthly prices** (first col: Date; other cols: tickers).",
         type=["csv"],
         help="Date must parse as YYYY-MM-DD (or similar)."
     )
