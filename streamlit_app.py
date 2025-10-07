@@ -3,7 +3,7 @@ import pandas as pd
 import streamlit as st
 import matplotlib.pyplot as plt
 import cvxpy as cp
-from pypfopt import risk_models
+# from pypfopt import risk_models  # not needed now
 
 st.set_page_config(page_title="Efficient Frontier & CML — Box Bounds", layout="wide")
 st.title("Efficient Frontier & CML (Box Bounds; ∑w = 1)")
@@ -22,6 +22,16 @@ with st.sidebar:
     allow_short = st.checkbox("Allow shorting", value=False)
     lower_bound = -1.0 if allow_short else 0.0
     upper_bound = 1.0
+
+    # Exposure caps shown only when shorts are allowed
+    if allow_short:
+        gross_cap  = st.slider("Gross exposure cap  ∑|w|", 1.0, 3.0, 1.5, 0.1)
+        long_cap   = st.slider("Long exposure cap   ∑w⁺", 1.0, 2.0, 1.1, 0.05)
+        short_cap  = st.slider("Short exposure cap  ∑|w⁻|", 0.0, 1.0, 0.5, 0.05)
+    else:
+        gross_cap = 1.0
+        long_cap = 1.0
+        short_cap = 0.0
 
     n_frontier = st.slider("Frontier points (γ sweep)", 30, 300, 140)
 
@@ -48,38 +58,48 @@ if prices.shape[1] < 2:
 
 tickers = list(prices.columns)
 
-#  μ and Σ from log returns (annualized)
+#  μ and Σ from log returns (exact annualization)
 rets = np.log(prices).diff().dropna()
-mu = rets.mean() * freq
-Sigma = risk_models.sample_cov(rets, frequency=freq, returns_data=True)  # annualized
+mu = np.expm1(rets.mean() * freq)           # exact annualization from log-returns
+Sigma = rets.cov() * freq                   # variance scales linearly with time
 mu_vec, Sigma_mat = mu.values, Sigma.values
 
 #  Helpers
-def clean_and_project(w, lb, ub, cutoff=1e-8):
-    """Zero tiny weights, clip to [lb, ub], then renormalize to sum to 1."""
-    w = np.array(w, float).ravel()
-    w[np.abs(w) < cutoff] = 0.0
-    w = np.clip(w, lb, ub)
-    s = w.sum()
-    return w if s == 0 else w / s
-
 def portfolio_stats(w, mu_vec, Sigma_mat, rf):
+    w = np.asarray(w, float).ravel()
     ret = float(w @ mu_vec)
-    vol = float(np.sqrt(max(w @ Sigma_mat @ w, 0.0)))
+    var = float(w @ Sigma_mat @ w)
+    vol = float(np.sqrt(max(var, 0.0)))
     sharpe = (ret - rf) / max(vol, 1e-12)
     return ret, vol, sharpe
 
-#  Solvers under BOX BOUNDS
-def solve_gamma_portfolio(mu_vec, Sigma_mat, rf, gamma, lb, ub):
+def exposures(w):
+    w = np.asarray(w, float).ravel()
+    long = float(np.sum(np.clip(w, 0, None)))
+    short = float(np.sum(np.clip(-w, 0, None)))
+    gross = long + short
+    return {"long": long, "short": short, "gross": gross, "net": float(long - short)}
+
+#  Solvers under BOX BOUNDS + optional exposure caps
+def solve_gamma_portfolio(mu_vec, Sigma_mat, rf, gamma, lb, ub,
+                          gross_cap=None, long_cap=None, short_cap=None):
     """
     max (μ−rf)^T w − ½γ w^T Σ w
-    s.t. 1^T w = 1, lb ≤ w ≤ ub
+    s.t. 1^T w = 1, lb ≤ w ≤ ub, [optional exposure caps]
     """
     n = len(mu_vec)
     w = cp.Variable(n)
     mu_ex = mu_vec - rf
     objective = cp.Maximize(mu_ex @ w - 0.5 * gamma * cp.quad_form(w, Sigma_mat))
     cons = [cp.sum(w) == 1, w >= lb, w <= ub]
+    # Exposure caps (pure constraints, no costs)
+    if gross_cap is not None:
+        cons.append(cp.norm1(w) <= gross_cap)            # ∑|w|
+    if long_cap is not None:
+        cons.append(cp.sum(cp.pos(w)) <= long_cap)       # ∑w⁺
+    if short_cap is not None:
+        cons.append(cp.sum(-cp.neg(w)) <= short_cap)     # ∑|w⁻|
+
     prob = cp.Problem(objective, cons)
     for solver in (cp.OSQP, cp.SCS, cp.ECOS):
         try:
@@ -90,12 +110,18 @@ def solve_gamma_portfolio(mu_vec, Sigma_mat, rf, gamma, lb, ub):
             pass
     raise RuntimeError("CVXPY failed in γ solve.")
 
-def solve_gmv(Sigma_mat, lb, ub):
-    """Min variance under 1^T w = 1, lb ≤ w ≤ ub."""
+def solve_gmv(Sigma_mat, lb, ub, gross_cap=None, long_cap=None, short_cap=None):
+    """Min variance under 1^T w = 1, lb ≤ w ≤ ub, with optional exposure caps."""
     n = Sigma_mat.shape[0]
     w = cp.Variable(n)
     obj = cp.quad_form(w, Sigma_mat)
     cons = [cp.sum(w) == 1, w >= lb, w <= ub]
+    if gross_cap is not None:
+        cons.append(cp.norm1(w) <= gross_cap)
+    if long_cap is not None:
+        cons.append(cp.sum(cp.pos(w)) <= long_cap)
+    if short_cap is not None:
+        cons.append(cp.sum(-cp.neg(w)) <= short_cap)
     prob = cp.Problem(cp.Minimize(obj), cons)
     for solver in (cp.OSQP, cp.SCS, cp.ECOS):
         try:
@@ -106,37 +132,37 @@ def solve_gmv(Sigma_mat, lb, ub):
             pass
     raise RuntimeError("CVXPY failed in GMV solve.")
 
-#  Frontier traced by γ (same constraints)
-def compute_frontier_by_gamma(mu_vec, Sigma_mat, rf, lb, ub, n_points):
+#  Frontier traced by γ (same constraints); dedup by (σ, μ)
+def compute_frontier_by_gamma(mu_vec, Sigma_mat, rf, lb, ub, n_points,
+                              gross_cap=None, long_cap=None, short_cap=None):
     gammas = np.logspace(np.log10(G_SWEEP_MAX), np.log10(G_SWEEP_MIN), n_points)  # high→low risk aversion
     vols, rets, ws = [], [], []
-    last_w = None
+    seen = set()
     for g in gammas:
-        w = solve_gamma_portfolio(mu_vec, Sigma_mat, rf, g, lb, ub)
-        w = clean_and_project(w, lb, ub, cutoff=1e-8)
-        # dedupe near-identical corners
-        if last_w is not None and np.linalg.norm(w - last_w, 1) <= 1e-8:
-            continue
+        w = solve_gamma_portfolio(mu_vec, Sigma_mat, rf, g, lb, ub,
+                                  gross_cap=gross_cap, long_cap=long_cap, short_cap=short_cap)
         r, s, _ = portfolio_stats(w, mu_vec, Sigma_mat, rf)
-        rets.append(r); vols.append(s); ws.append(w); last_w = w
+        key = (round(float(s), 6), round(float(r), 6))
+        if key in seen:
+            continue
+        seen.add(key)
+        rets.append(r); vols.append(s); ws.append(w)
     vols = np.array(vols); rets = np.array(rets)
     order = np.argsort(vols)
     return vols[order], rets[order], [ws[i] for i in order]
 
-#  Key portfolios
-# γ portfolio (investor choice) — BOX BOUNDS
-w_gamma = solve_gamma_portfolio(mu_vec, Sigma_mat, rf, gamma, lower_bound, upper_bound)
-w_gamma = clean_and_project(w_gamma, lower_bound, upper_bound, cutoff=1e-8)
+#  Key portfolios  — apply the SAME constraints everywhere
+w_gamma = solve_gamma_portfolio(mu_vec, Sigma_mat, rf, gamma, lower_bound, upper_bound,
+                                gross_cap=gross_cap, long_cap=long_cap, short_cap=short_cap)
 gamma_ret, gamma_vol, gamma_sharpe = portfolio_stats(w_gamma, mu_vec, Sigma_mat, rf)
 
-# GMV (min variance) — BOX BOUNDS
-w_gmv = solve_gmv(Sigma_mat, lower_bound, upper_bound)
-w_gmv = clean_and_project(w_gmv, lower_bound, upper_bound, cutoff=1e-8)
+w_gmv = solve_gmv(Sigma_mat, lower_bound, upper_bound,
+                  gross_cap=gross_cap, long_cap=long_cap, short_cap=short_cap)
 gmv_ret, gmv_vol, _ = portfolio_stats(w_gmv, mu_vec, Sigma_mat, rf)
 
-# Frontier (preference-free) — traced by γ with SAME constraints (fixed sweep)
 ef_vols, ef_rets, ef_ws = compute_frontier_by_gamma(
-    mu_vec, Sigma_mat, rf, lower_bound, upper_bound, n_frontier
+    mu_vec, Sigma_mat, rf, lower_bound, upper_bound, n_frontier,
+    gross_cap=gross_cap, long_cap=long_cap, short_cap=short_cap
 )
 
 # Constrained tangency taken FROM the same EF (consistent CML)
@@ -154,7 +180,7 @@ else:
 fig, ax = plt.subplots(figsize=(4, 3), dpi=120)
 
 if ef_vols.size:
-    ax.plot(ef_vols, ef_rets, lw=1.8, alpha=0.95, label="Efficient Frontier (γ sweep, box bounds)")
+    ax.plot(ef_vols, ef_rets, lw=1.8, alpha=0.95, label="Efficient Frontier (γ sweep, box bounds + caps)")
 
 # key points
 ax.scatter([gmv_vol], [gmv_ret], marker="D", label="GMV")
@@ -171,7 +197,7 @@ ax.set_xlim(0, xmax)
 ax.margins(y=0.05)
 ax.set_xlabel("Volatility (σ, annualized)")
 ax.set_ylabel("Expected Return (μ, annualized)")
-ax.set_title(f"Efficient Frontier — Box Bounds [{lower_bound:.1f}, {upper_bound:.1f}] & Γ-Portfolio")
+ax.set_title(f"Efficient Frontier — Box Bounds [{lower_bound:.1f}, {upper_bound:.1f}] with Exposure Caps")
 ax.legend(loc="best", fontsize=8)
 st.pyplot(fig, clear_figure=True)
 
@@ -189,7 +215,15 @@ summary_df = pd.DataFrame({
 })
 st.dataframe(summary_df.round(6), use_container_width=True)
 
-st.markdown("### Weights")
+st.markdown("### Exposures")
+exp_df = pd.DataFrame([
+    {"Portfolio": "GMV", **exposures(w_gmv)},
+    {"Portfolio": "Tangency (constr.)", **exposures(w_tan)},
+    {"Portfolio": f"Gamma (γ={gamma:.2f})", **exposures(w_gamma)},
+]).set_index("Portfolio")
+st.dataframe(exp_df.round(6), use_container_width=True)
+
+st.markdown("### Weights (non-zero)")
 def weights_df(weights, tickers):
     df = pd.DataFrame({"Ticker": tickers, "Weight": weights})
     df["Weight"] = df["Weight"].round(6)
@@ -221,6 +255,6 @@ st.download_button(
 )
 
 st.caption(
-    "Frontier is generated by sweeping γ with fixed log-range (hard-coded) under the same box bounds. "
-    "Kinks appear where bounds become active or the active asset set changes — expected with box constraints."
+    "Frontier generated by sweeping γ under identical box bounds with exposure caps. "
+    "Caps (∑|w|, ∑w⁺, ∑|w⁻|) prevent unrealistic long–short corner piles while keeping the MVP objective frictionless."
 )
