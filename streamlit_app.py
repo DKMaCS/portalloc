@@ -49,7 +49,7 @@ if prices.shape[1] < 2:
 tickers = list(prices.columns)
 
 #  μ and Σ from log returns (annualized)
-#rets = np.log(prices).diff().dropna()
+rets = np.log(prices).diff().dropna()
 #mu = rets.mean() * freq
 #igma = risk_models.sample_cov(rets, frequency=freq, returns_data=True)  # annualized
 mu_daily = rets.mean()
