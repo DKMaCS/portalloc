@@ -50,8 +50,10 @@ tickers = list(prices.columns)
 
 #  μ and Σ from log returns (annualized)
 rets = np.log(prices).diff().dropna()
-mu = np.exp(rets.mean() * freq) - 1.0
-Sigma = risk_models.sample_cov(rets, frequency=freq, returns_data=True)  # annualized
+#mu = rets.mean() * freq
+#Sigma = risk_models.sample_cov(rets, frequency=freq, returns_data=True)  # annualized
+mu = np.expm1(mu_daily * freq)          # = exp(mean*freq) - 1
+Sigma = Sigma_daily * freq              # variance scales linearly
 mu_vec, Sigma_mat = mu.values, Sigma.values
 
 #  Helpers
